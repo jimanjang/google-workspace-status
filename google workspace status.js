@@ -2,12 +2,12 @@
 const SUPPRESS_FIRST_SEND = false;  // 첫 실행에도 전송
 
 // 1) 스페이스 Webhook URL
-const WEBHOOK_URL = 'https://chat.googleapis.com/v1/spaces/AAQAUcz7qjY/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=ST7kUpV9GdhRO4IYa0CGYoG7hQeu1GIAyZC6rVDjiqE';
+const WEBHOOK_URL = 'https://chat.googleapis.com/v1/spaces/AAQAvRvdbkY/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=I2S1P2AFHImwunrL6BeP_6-oJ-kko6TFQU86pN7Guk0';
 const THREAD_KEY   = 'workspace-status';
 
-const ONLY_MAJOR   = true;   // OUTAGE/DISRUPTION만 알림
-const ONLY_ONGOING = true;   // end가 없는 '진행 중'만 알림
-const MAX_ITEMS    = 5;      // 최대 표시 개수
+const ONLY_MAJOR   = false;   // OUTAGE/DISRUPTION만 알림
+const ONLY_ONGOING = false;    // end가 없는 '진행 중'만 알림
+const MAX_ITEMS    = 1;       // 최대 표시 개수
 
 /** ====== 데이터 소스 ====== **/
 const BASE = 'https://www.google.com/appsstatus/dashboard';
@@ -30,10 +30,19 @@ function normalizeProducts(raw) {
   arr.forEach(p => map[p.id] = p.title || p.name || p.product_name || p.id);
   return map;
 }
-function lastUpdate(inc) {
-  const u = inc.updates || [];
-  return u.length ? u[u.length - 1] : (inc.most_recent_update || null);
+
+/** 최신 업데이트 선택 유틸 (정렬 무관, most_recent_update 우선) */
+function getUpdateMillis(u) {
+  const t = u?.when || u?.update_time || u?.updated || u?.time || u?.timestamp;
+  return t ? new Date(t).getTime() : 0;
 }
+function lastUpdate(inc) {
+  if (inc?.most_recent_update) return inc.most_recent_update;
+  const u = inc?.updates || [];
+  if (!u.length) return null;
+  return u.reduce((a, b) => (getUpdateMillis(a) >= getUpdateMillis(b) ? a : b));
+}
+
 function fmtUTC(iso){
   if(!iso) return '';
   return Utilities.formatDate(new Date(iso), 'UTC', "yyyy-MM-dd HH:mm:ss '(UTC)'");
@@ -51,28 +60,70 @@ function postToChatText(text) {
   Logger.log(res.getResponseCode() + ' ' + res.getContentText());
 }
 
+/** ====== 텍스트 정제 유틸 ====== **/
+// \u003c, \u003e, HTML 엔티티, 태그, 마크다운(**, `코드`) 제거 + 줄바꿈 정리
+function unescapeAnglesAndEntities(s) {
+  return String(s)
+    .replace(/\\u003c/gi, '<').replace(/\\u003e/gi, '>')
+    .replace(/&lt;/gi,'<').replace(/&gt;/gi,'>').replace(/&amp;/gi,'&')
+    .replace(/&quot;/gi,'"').replace(/&#39;/gi,"'");
+}
+function stripHtml(s) {
+  let x = unescapeAnglesAndEntities(s);
+  // 블록 단위 태그를 줄바꿈으로 치환
+  x = x
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/\s*(p|div|li|h[1-6])\s*>/gi, '\n')
+    .replace(/<\s*hr[^>]*>/gi, '\n')
+    .replace(/<ul[^>]*>|<\/ul>|<ol[^>]*>|<\/ol>|<li[^>]*>/gi, '\n');
+  // 나머지 태그 제거
+  x = x.replace(/<[^>]+>/g, '');
+  return x;
+}
+function stripMarkdown(s) {
+  return String(s)
+    // **bold** -> bold
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    // *italic* -> italic (양끝 별 하나 제거)
+    .replace(/(^|[\s(])\*(\S[^*]*?)\*(?=[\s).,;!?]|$)/g, '$1$2')
+    // 인라인 코드 `...` 및 ```...``` 제거
+    .replace(/```[\s\S]*?```/g, m => m.replace(/```/g,''))
+    .replace(/`([^`]*)`/g, '$1');
+}
+function squashWhitespace(s) {
+  return String(s)
+    .replace(/\r/g,'')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+function sanitize(s) {
+  return squashWhitespace(stripMarkdown(stripHtml(s)));
+}
+
 /** ====== 번역/문구 유틸 ====== **/
-// 제품명은 영어 그대로 두고, 섹션 텍스트만 한국어 번역
 function trKo(s) {
-  if (!s) return '';
+  const clean = sanitize(s);
+  if (!clean) return '';
   try {
-    // 원문이 영어가 아닐 수도 있으니 자동 감지 → ko
-    return LanguageApp.translate(String(s), '', 'ko');
+    return LanguageApp.translate(clean, '', 'ko');
   } catch (e) {
     Logger.log('Translate fail: ' + e.message);
-    return s;
+    return clean;
   }
 }
+
+// 상태 문구 확대 (DEGRADED, ISSUE 등)
 function statusKoFromRaw(statusRaw) {
   if (/OUTAGE/i.test(statusRaw)) return '서비스 중단';
-  if (/DISRUPTION/i.test(statusRaw)) return '부분 장애';
+  if (/DISRUPTION|DEGRADED|ISSUE|PARTIAL/i.test(statusRaw)) return '부분 장애';
   return '정보';
 }
 
 /** ====== 문자열/제품명 유틸 ====== **/
 function toName(x, productMap) {
   if (!x) return null;
-  if (typeof x === 'string') return productMap[x] || x;  // id 또는 이름
+  if (typeof x === 'string') return productMap[x] || x;
   return x.title || x.name || x.product_name || (x.id ? (productMap[x.id] || x.id) : null);
 }
 function collectAllStrings(obj, out) {
@@ -131,11 +182,8 @@ function scanNamesInTexts(productMap, texts) {
 }
 function extractProductNames(inc, productMap) {
   const names = new Set();
-
-  // 1) 구조화 필드
   (inc.products || []).forEach(v => { const n = toName(v, productMap); if (n) names.add(n); });
   (inc.product_ids || []).forEach(v => { const n = toName(v, productMap); if (n) names.add(n); });
-  (inc.impacted_products || []).forEach(v => { const n = toName(v, productMap); if (n) names.add(n); });
 
   const ed = inc.external_desc || {};
   (ed.products || []).forEach(v => { const n = toName(v, productMap); if (n) names.add(n); });
@@ -156,7 +204,6 @@ function extractProductNames(inc, productMap) {
     });
   });
 
-  // 2) 없으면 텍스트 전체 스캔
   if (!names.size) {
     const texts = collectAllStrings(inc, []);
     scanNamesInTexts(productMap, texts).forEach(n => names.add(n));
@@ -203,8 +250,9 @@ function extractSectionsFromText(text) {
 
 /** ====== 필터 ====== **/
 function isMajor(status='') {
+  if (!status) return false;
   const s = status.toUpperCase();
-  return s.includes('OUTAGE') || s.includes('DISRUPTION');
+  return /(OUTAGE|DISRUPTION|DEGRADED|SERVICE ISSUE|PARTIAL|DEGRADATION)/.test(s);
 }
 function isOngoing(inc) { return !inc.end; }
 function keepIncident(inc) {
@@ -217,22 +265,22 @@ function keepIncident(inc) {
 /** ====== 메시지 구성 (한국어 표시) ====== **/
 function formatLines(items, productMap) {
   return items.slice(0, MAX_ITEMS).map(inc => {
-    const last   = lastUpdate(inc) || {};
-    const when   = fmtUTC(inc.begin);
-    const statusRaw = last.status || '';
+    const lu       = inc.most_recent_update || lastUpdate(inc) || {};
+    const when     = fmtUTC(inc.begin);
+    const statusRaw= lu.status || '';
     const sev = /OUTAGE/i.test(statusRaw) ? '🔴'
-             : /DISRUPTION/i.test(statusRaw) ? '🟠'
+             : /DISRUPTION|DEGRADED|ISSUE|PARTIAL/i.test(statusRaw) ? '🟠'
              : 'ℹ️';
     const statusKo = statusKoFromRaw(statusRaw);
 
-    // 섹션 파싱 + 한국어 번역 (제품명/URL은 그대로)
+    // 섹션 파싱 후 정제/번역
     const baseTitle = inc.external_desc?.title || inc.title || 'Incident';
-    const sections = extractSectionsFromText(last.text || inc.external_desc?.text || '');
-    const titleEn = sections.Title || baseTitle;
-    const titleKo = trKo(titleEn);
-    const descKo = sections.Description ? trKo(sections.Description) : '';
-    const sympKo = sections.Symptoms ? trKo(sections.Symptoms) : '';
-    const workKo = sections.Workaround ? trKo(sections.Workaround) : '';
+    const sections  = extractSectionsFromText(lu.text || inc.external_desc?.text || '');
+
+    const titleKo = trKo(sections.Title || baseTitle);
+    const descKo  = sections.Description ? trKo(sections.Description) : '';
+    const sympKo  = sections.Symptoms ? trKo(sections.Symptoms) : '';
+    const workKo  = sections.Workaround ? trKo(sections.Workaround) : '';
 
     // 제품명(영어 유지)
     const prodNames = extractProductNames(inc, productMap);
@@ -240,57 +288,73 @@ function formatLines(items, productMap) {
 
     const link = inc.id ? `${BASE}/incidents/${encodeURIComponent(inc.id)}?hl=en` : '';
 
-    // 출력 (한국어 라벨 + 영어 제품명 유지)
+    // 출력: 마크다운 굵게(*) 없이 평문 레이블 사용
     const parts = [
-      `${sev} *${titleKo}*`,
-      `• 시간: ${when}`,
+      `${sev} ${titleKo}`,
+      `• 최초 오류 보고시간: ${when}`,
       `• 상태: ${statusKo}`,
       `• 서비스: ${prods}`,
-      link ? `• 링크: ${link}` : ''
+      link ? `• 오류 상세링크: ${link}` : ''
     ].filter(Boolean);
 
     const blocks = [
-      '*제목*',
-      titleKo,
-      descKo ? '\n*설명*\n' + descKo.trim() : '',
-      sympKo ? '\n*증상*\n' + sympKo.trim() : '',
-      workKo ? '\n*우회 방법*\n' + workKo.trim() : ''
+      `제목: ${titleKo}`,
+      descKo ? `\n설명:\n${descKo.trim()}` : '',
+      sympKo ? `\n증상:\n${sympKo.trim()}` : '',
+      workKo ? `\n우회 해결방법:\n${workKo.trim()}` : ''
     ].filter(Boolean);
 
-    return parts.join('\n') + '\n\n' + blocks.join('\n');
+    // 최종 정리: 혹시 남은 마크다운/HTML이 있어도 sanitize로 한 번 더
+    return sanitize(parts.join('\n')) + '\n\n' + sanitize(blocks.join('\n'));
   });
 }
 
 /** ====== 해시/상태 저장 ====== **/
+function md5Hex(s) {
+  if (s == null) s = '';
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5,
+    String(s),
+    Utilities.Charset.UTF_8
+  );
+  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
 function fingerprint(items) {
   return items.map(inc => {
-    const last = lastUpdate(inc) || {};
+    const lu = inc.most_recent_update || lastUpdate(inc) || {};
+    const lastWhen =
+      lu.when || lu.update_time || lu.updated || lu.time || lu.timestamp || '';
+    const updatesLen = (inc.updates || []).length;
+    const lastTextHash = md5Hex(lu.text || '');
     return [
       inc.id || inc.external_desc?.title || inc.title || inc.begin || 'unknown',
-      (last.status || '').toUpperCase(),
-      inc.end ? 'ENDED' : 'OPEN'
+      (lu.status || '').toUpperCase(),
+      inc.end ? 'ENDED' : 'OPEN',
+      lastWhen,
+      updatesLen,
+      lastTextHash
     ].join('|');
   }).join(',');
 }
 function getPropKey(query) { return 'GWS_ALERT_FINGERPRINT__' + (query ? String(query).toLowerCase() : '*'); }
 function getSummaryKey(query) { return 'GWS_ALERT_LAST_OPEN_SUMMARY__' + (query ? String(query).toLowerCase() : '*'); }
 
-/** ====== 수동 실행 (항상 전송) ====== **/
+/** ====== 수동 실행 ====== **/
 function pushWorkspaceStatusToChat(query) {
   const {items, productMap} = loadAlertableItems(query);
-
   if (!items.length) {
     postToChatText(`✅ 현재 공개된 사고가 없습니다.`);
     return;
   }
-
   const lines = formatLines(items, productMap);
   postToChatText(lines.join('\n\n'));
 }
 
-/** ====== 트리거 실행 (변화 감지) ====== **/
-function pushWorkspaceStatusIfIncident(query) {
+/** ====== 트리거 실행 ====== **/
+function pushWorkspaceStatusIfIncident() {
+  const query = null;  // 또는 '' – 트리거에서는 항상 전체 조회
   const {items, productMap} = loadAlertableItems(query);
+
   const curr = fingerprint(items);
   const key  = getPropKey(query);
   const skey = getSummaryKey(query);
@@ -307,14 +371,16 @@ function pushWorkspaceStatusIfIncident(query) {
   }
 
   if (!items.length && prev !== '') {
-    postToChatText(`✅ 진행 중이던 사고가 모두 해결되었습니다.${prevSummary ? '\n\n해결된 사고 요약(이전 상태):\n' + prevSummary : ''}`);
+    postToChatText(
+      `✅ 진행 중이던 사고가 모두 해결되었습니다.` +
+      (prevSummary ? '\n\n해결된 사고 요약(이전 상태):\n' + sanitize(prevSummary) : '')
+    );
     props.setProperty(key, '');
     props.deleteProperty(skey);
     return;
   }
 
   if (!items.length) {
-    if (prev !== '') props.setProperty(key, '');
     props.deleteProperty(skey);
     Logger.log('No alertable incidents. Skipping send.');
     return;
@@ -331,6 +397,7 @@ function pushWorkspaceStatusIfIncident(query) {
   props.setProperty(skey, lines.join('\n\n'));
 }
 
+
 /** ====== 내부: 데이터 로드 + 필터 ====== **/
 function loadAlertableItems(query) {
   const incidentsRaw = fetchJson(BASE + '/incidents.json');
@@ -339,6 +406,12 @@ function loadAlertableItems(query) {
 
   let items = normalizeIncidents(incidentsRaw)
     .sort((a,b) => new Date(b.begin) - new Date(a.begin));
+
+  Logger.log(`총 ${items.length}건의 사건을 불러왔습니다.`);
+  items.forEach(inc => {
+    const st = (lastUpdate(inc)?.status || '(no status)');
+    Logger.log(`- ${inc.id || '(no id)'} / ${st}`);
+  });
 
   if (query) {
     const q = String(query).toLowerCase();
@@ -351,6 +424,7 @@ function loadAlertableItems(query) {
   }
 
   items = items.filter(keepIncident);
+  Logger.log(`필터 통과 후 남은 사건 수: ${items.length}`);
   return { items, productMap };
 }
 
