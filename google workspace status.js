@@ -2,7 +2,7 @@
 const SUPPRESS_FIRST_SEND = false;  // 첫 실행에도 전송
 
 // 1) 스페이스 Webhook URL
-const WEBHOOK_URL = 'https://chat.googleapis.com/v1/spaces/AAQAvRvdbkY/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=I2S1P2AFHImwunrL6BeP_6-oJ-kko6TFQU86pN7Guk0';
+const WEBHOOK_URL = 'https://chat.googleapis.com/v1/spaces/AAQAvRvdbkY/messages?key=&token=';
 const THREAD_KEY   = 'workspace-status';
 
 const ONLY_MAJOR   = false;   // OUTAGE/DISRUPTION만 알림
